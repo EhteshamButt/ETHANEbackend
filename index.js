@@ -1,0 +1,181 @@
+const express = require('express')
+const cors = require('cors')
+const dotenv = require('dotenv')
+const bcrypt = require('bcryptjs')
+const jwt = require('jsonwebtoken')
+const mongoose = require('mongoose')
+
+dotenv.config()
+
+const app = express()
+const port = process.env.PORT || 8080
+const jwtSecret = process.env.JWT_SECRET || process.env.ACCESS_TOKEN_SECRET || 'change-me'
+const dbUrl = process.env.DATABASE_URL
+
+const corsOptions = {
+  origin: ['http://127.0.0.1:8000', 'http://localhost:8000'],
+  methods: ['GET', 'POST', 'PUT', 'PATCH', 'DELETE', 'OPTIONS'],
+  allowedHeaders: ['Content-Type', 'Authorization'],
+  credentials: true,
+}
+
+app.use(cors(corsOptions))
+app.options('*', cors(corsOptions))
+app.use(express.json())
+
+// --- DB connection ---
+async function connectDb() {
+  if (!dbUrl) {
+    console.warn('[db] DATABASE_URL is missing; API will fail without a DB.')
+    return
+  }
+  try {
+    await mongoose.connect(dbUrl)
+    console.log('[db] connected')
+  } catch (err) {
+    console.error('[db] connection error', err)
+    process.exit(1)
+  }
+}
+
+// --- Schemas ---
+const userSchema = new mongoose.Schema(
+  {
+    email: { type: String, unique: true, required: true },
+    username: { type: String, unique: true, sparse: true },
+    name: { type: String },
+    password: { type: String, required: true },
+  },
+  { timestamps: true }
+)
+
+const cvSchema = new mongoose.Schema(
+  {
+    userId: { type: mongoose.Schema.Types.ObjectId, ref: 'User', required: true },
+    data: { type: mongoose.Schema.Types.Mixed, required: true },
+    withPhoto: { type: Boolean, default: false },
+    plan: { type: String, default: 'student' },
+    title: { type: String, default: 'CV' },
+  },
+  { timestamps: true }
+)
+
+const User = mongoose.model('User', userSchema)
+const Cv = mongoose.model('Cv', cvSchema)
+
+// --- Helpers ---
+function signToken(user) {
+  return jwt.sign({ sub: user._id.toString(), email: user.email }, jwtSecret, { expiresIn: '7d' })
+}
+
+async function auth(req, res, next) {
+  const header = req.headers.authorization || ''
+  const token = header.startsWith('Bearer ') ? header.slice(7) : null
+  if (!token) return res.status(401).json({ error: 'Missing token' })
+  try {
+    const payload = jwt.verify(token, jwtSecret)
+    req.user = payload
+    next()
+  } catch {
+    return res.status(401).json({ error: 'Invalid token' })
+  }
+}
+
+// --- Routes ---
+app.get('/', (_req, res) => {
+  res.send('API is live')
+})
+
+app.post('/api/auth/signup', async (req, res) => {
+  const { email, password, name } = req.body || {}
+  if (!email || !password || password.length < 6) {
+    return res.status(400).json({ error: 'Email and password (>=6 chars) are required.' })
+  }
+  const emailLower = email.toLowerCase()
+  const exists = await User.findOne({ email: emailLower }).lean()
+  if (exists) return res.status(409).json({ error: 'User already exists' })
+  const hash = await bcrypt.hash(password, 10)
+  try {
+    const user = await User.create({
+      email: emailLower,
+      username: emailLower,
+      name: name || email.split('@')[0],
+      password: hash,
+    })
+    const token = signToken(user)
+    return res.json({ token, user: { id: user._id, email: user.email, name: user.name } })
+  } catch (err) {
+    if (err?.code === 11000) {
+      return res.status(409).json({ error: 'User already exists' })
+    }
+    console.error('[signup] error', err)
+    return res.status(500).json({ error: 'Signup failed' })
+  }
+})
+
+app.post('/api/auth/login', async (req, res) => {
+  const { email, password } = req.body || {}
+  if (!email || !password) return res.status(400).json({ error: 'Email and password required.' })
+  const user = await User.findOne({ email: email.toLowerCase() })
+  if (!user) return res.status(401).json({ error: 'Invalid credentials' })
+  const ok = await bcrypt.compare(password, user.password)
+  if (!ok) return res.status(401).json({ error: 'Invalid credentials' })
+  const token = signToken(user)
+  return res.json({ token, user: { id: user._id, email: user.email, name: user.name } })
+})
+
+app.get('/api/auth/me', auth, async (req, res) => {
+  const user = await User.findById(req.user.sub).lean()
+  if (!user) return res.status(404).json({ error: 'User not found' })
+  return res.json({ user: { id: user._id, email: user.email, name: user.name } })
+})
+
+app.get('/api/cv', auth, async (req, res) => {
+  const cvs = await Cv.find({ userId: req.user.sub }).sort({ updatedAt: -1 }).lean()
+  return res.json({ cvs })
+})
+
+app.get('/api/cv/:id', auth, async (req, res) => {
+  const cv = await Cv.findOne({ _id: req.params.id, userId: req.user.sub }).lean()
+  if (!cv) return res.status(404).json({ error: 'Not found' })
+  return res.json({ cv })
+})
+
+app.post('/api/cv', auth, async (req, res) => {
+  const { id, data, withPhoto, plan, title } = req.body || {}
+  if (!data) return res.status(400).json({ error: 'CV data is required' })
+  let cv
+  if (id) {
+    cv = await Cv.findOneAndUpdate(
+      { _id: id, userId: req.user.sub },
+      { data, withPhoto: !!withPhoto, plan: plan || 'student', title: title || 'CV' },
+      { new: true }
+    )
+  } else {
+    cv = await Cv.create({
+      userId: req.user.sub,
+      data,
+      withPhoto: !!withPhoto,
+      plan: plan || 'student',
+      title: title || (data.fullName || 'CV'),
+    })
+  }
+  return res.json({ cv })
+})
+
+// 404 handler
+app.use((_req, res) => {
+  res.status(404).send("Sorry can't find that!")
+})
+
+// Error handler
+app.use((err, _req, res, _next) => {
+  console.error(err.stack)
+  res.status(500).send('Something broke!')
+})
+
+connectDb().then(() => {
+  app.listen(port, () => {
+    console.log(`App is listening on port ${port}`)
+  })
+})
