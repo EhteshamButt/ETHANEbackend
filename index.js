@@ -13,7 +13,7 @@ const jwtSecret = process.env.JWT_SECRET || process.env.ACCESS_TOKEN_SECRET || '
 const dbUrl = process.env.DATABASE_URL
 
 const corsOptions = {
-  origin: ['http://127.0.0.1:8000', 'http://localhost:8000'],
+  origin: true, // Allow all origins
   methods: ['GET', 'POST', 'PUT', 'PATCH', 'DELETE', 'OPTIONS'],
   allowedHeaders: ['Content-Type', 'Authorization'],
   credentials: true,
